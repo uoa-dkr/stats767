@@ -1,0 +1,276 @@
+---
+title: "767-proj-code"
+author: "dkr"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import Dataset and Packages
+
+```{r,warning=FALSE,message=FALSE,cache=TRUE}
+library(dslabs) # obtain handwriting dataset 
+library(tidyverse)
+library(rpart)  # decision tree
+library(ranger) # random forest
+library(e1071)  # naive bayes
+library(kknn)   # knn
+
+
+set.seed(767) # reproducebility
+train_n <- sample(1:6e4,6e4*0.2) # randomly pick 20% of the training data
+test_n <- sample(1:1e4,1e4*0.2)  # randomly pick 20% of the testing data
+
+mnist <- dslabs::read_mnist()
+train_x <- mnist$train$images[train_n,]
+train_y <- mnist$train$labels[train_n]
+test_x <- mnist$test$images[test_n,]
+test_y <- mnist$test$labels[test_n]
+```
+
+***The hand written dataset is composed of 70000 rows and 10000 columns, which 60000 used for training and 10000 for testing. Due to the running time of high dimension dataset in different machine learning algorithms and PCA, we decide to utilise 20% of original dataset, that is, 12000 for training and 2000 for testing.***
+
+## EDA(Exploratory Data Analysis)
+
+```{r,message=FALSE,cache=TRUE,warning=FALSE}
+# data
+train_df <- bind_cols(as.factor(train_y),train_x) %>% set_names(c('y',paste0('v',1:784)))
+test_df <- bind_cols(as.factor(test_y),test_x) %>% set_names(c('y',paste0('v',1:784)))
+
+# dimensionality of data
+dim(train_df)
+dim(test_df)
+
+# data check
+set.seed(1)
+sam <- sample(1:784,10)
+train_df[sam] %>% glimpse()
+test_df[sam] %>% skimr::skim()
+table(train_df$y)
+
+# visualization for the hand writing
+hw <- train_df %>% 
+  head(20) %>% 
+  group_by(y) %>% 
+  dplyr::slice(1) %>% 
+  ungroup()
+
+y <- 1:10 %>% 
+  map(~apply((matrix(((hw[.,-1])),28,28)),2,as.numeric))
+m <- par(mfrow=c(2,5))
+for (i in 1:10) {
+  tempt <- y[[i]]
+  image(1:28, 1:28, tempt[,nrow(tempt):1], col=gray((0:255)/255),
+        axes=F, main=hw$y[i],xlab = '',ylab='')
+}
+par(m) # reset
+```
+
+***Since dimension of the dataset is still 12000x785, then it's hard to detect the pattern of each variables, therefore, 10 random variables has been picked to used to do a data normality check. The dataset has already been scaled, so `scale.=TRUE` may not be expected in the following pca analysis. The number of different hand written digits in the response variable is roughly same. The visualization just simply shows some correct classified digits.***
+
+## Performing PCA
+
+Principal component analysis (PCA) allows us to summarize a set of features with a smaller number of representative features that collectively explain most of the variability in the original data set. PCA projects the observations described by d features into orthogonal, and thus by definition uncorrelated, variables. The new set of synthetic variables is equal in number to the original set. However, the first synthetic variable represents as much of the common variation of the original variables as possible, the second variable represents as much of the residual variation as possible, and so forth.(reference).
+
+When performing PCA, if the data has standardized, the pca would expect correlation matrix as the input, on the other hand, if the data is not on the same scale, the covariance matrix should be input for pca. Once the input has determined, the next crucial step is to obtain the eigenvector of the correlation/covariance matrix, or principal components, that capture the maximum amount of variation in the original data. The first principal component captures the largest possible variance in the data, and each subsequent component captures the maximum remaining variance, subject to the constraint that it is orthogonal to the previous components. The variances can be represented as square of the eigenvalues. The number of principle components would be `Min(n,p)`, where n is the number of samples and p is the number variables.
+
+The mathematical expression for covariance matrix is $$\rho_{(x,y)}=\frac{1}{n-1}\sum^{N}_{i=1}(x_i-\bar{x})(y_i-\bar{y})$$ and the mathematical expression for correlation matrix is $$r_{(X,Y)}=\frac{Cov(X,Y)}{\sqrt{Var(X)Var(Y)}}$$
+
+The eigenvector can be computed as $$A\vec{v}=\lambda\vec{v}$$ where A is the matrix, $\vec{v}$ is an eigenvector and $\lambda$ is a scalar(eigenvalue)
+
+In `prcomp`, the eigenvectors are defined by the `rotation`, also called principal components of the pca, which are the directions along which the data vary the most, note that, the sum of squared each principal component is 1.
+
+The eigenvalues or variances can be found in `sdev`, and used to determine the number of principal components.
+
+In order to gain the principal component scores, which correspond to the projection of the original data on the directions of the principal component, it has stored in `x` in prcomp.
+
+There are generally three ways for choosing the number of principal component:
+
+1. Elbow rule
+2. Kaiser rule
+3. Variance explained criteria rule
+
+
+```{r,cache=TRUE}
+mnist_pca <- prcomp(train_df[,-1])
+screeplot(mnist_pca,npcs=50) # hard to tell
+plot(1:780, cumsum((mnist_pca$sdev[1:780])^2/sum((mnist_pca$sdev)^2)),type = 'b',ylab = 'variance')
+plot(1:25, cumsum((mnist_pca$sdev[1:25])^2/sum((mnist_pca$sdev)^2)),type = 'b',ylab = 'variance')
+
+mnist_pca_25 <- prcomp(train_df[,-1],rank.=25) # 25 principal components
+mnist_pca_25$rotation[,1] %>% head();mnist_pca_25$rotation[,1] %>% tail() # demonstration
+
+# verification
+predict(mnist_pca_25,train_df[,-1])[1,1]==as.matrix(scale(train_df[1,-1],center = mnist_pca_25$center,scale = F))%*%mnist_pca_25$rotation[,1]
+sum(mnist_pca$rotation[,1]^2)
+
+# transformed data
+new_train <- bind_cols(y=as.factor(train_y),predict(mnist_pca_25,train_df[,-1]))
+new_test <- bind_cols(y=as.factor(test_y),predict(mnist_pca_25,test_df[,-1]))
+```
+
+***It's hard to tell the number principal components via screeplot, but it's clear that n above 200 is increasing slightly, and it's sensible to select n between 20 to 200 as its corresponding variability accounts for 60% to 90%.***
+
+***As a consequence, the pca has refitted with 25 principal components. it basically means the 12000x784 dataset has dimensional reduced to 12000x25, the first principal component can roughly be expressed as*** $$P_1=\begin{pmatrix}
+  \phi_{11} \\
+  \phi_{21} \\
+  \phi_{31} \\
+  \vdots   \\
+  \phi_{n1} 
+ \end{pmatrix}=\begin{pmatrix}
+  3.75\times10^{-19} \\
+  1.66\times10^{-16} \\
+  -5.55\times10^{-17} \\
+  \vdots   \\
+  0 
+ \end{pmatrix}$$***recall the definition that $\sum^{n}_{i=1}\phi_n^2=1$.***
+
+***To find out the first projected data, the approach is to apply the `predict` function, the formula behind that is $$New_{11}=\phi_{11}\times V_{11}+\phi_{21}\times V_{12}+\phi_{31}\times V_{13}+\cdots+\phi_{n1}\times V_{1n}$$ where n is number of variable and $V_{1n}$ is first scaled(not in this case) and centered row of original data.***
+
+## Building Models
+**Since the main objective is to compare the performance of models before and after pca, therefore, the following machine learning algorithms would not be involved by any hyperparameter tuning(all default) or remedy for overfitting and underfitting.**
+
+#### Decision tree
+
+Decision tree is a common machine learning algorithm that is commonly used for classification and regression analysis. It is a tree-like model used to represent a set of decisions and their possible consequences, including chance events and the likelihood of various outcomes. 
+ 
+The decision tree starts with a root node that represents the entire data set. The nodes of the tree are divided into multiple children based on specific characteristics and attributes, forming a series of branches. Each internal node contains a property test, and each leaf node represents a category or a numerical result. By moving around the tree, the input data set is classified to the correct leaf node based on its characteristic values. The goal of decision tree algorithm is to minimize the classification error rate or maximize the prediction accuracy by selecting the optimal attribute division.
+
+The package named `rpart` is one of the implementations for decision tree in R. 
+```{r,warning=FALSE,message=FALSE,cache=TRUE}
+set.seed(12)
+t1 <- system.time(rpart((y)~.,data=train_df)) # elapsed time for model generation before pca
+dc <- rpart((y)~.,data=train_df) # build a decision tree without pca
+pred <- predict(dc,test_df[,-1],type = 'class') # prediction
+tab <- table(actual=test_df$y,predict=pred);tab # contingency table
+r1 <- sum(diag(tab))/sum(tab);r1 # misclassification rate
+
+
+t2 <- system.time(rpart(y~.,data=new_train)) # elapsed time for model generation after pca
+dc_mod <- rpart(y~.,data=new_train) # build a decision tree with pca
+pred1 <- predict(dc_mod,new_test[,-1],type = 'class')
+tab1 <- table(actual=new_test$y,predict=pred1);tab1
+r2 <- sum(diag(tab1))/sum(tab1);r2
+```
+
+***The running times for the decision tree classifier are respectively, and the misclassification rates are respectively, it seems to the pca has done an excellent job since the rates are pretty much identical, and the elapsed time is greatly shortened.***
+
+
+#### random forest
+Random Forest is an Ensemble Learning method, which consists of several Decision trees. Each decision tree is trained independently, and its training data is obtained from the original data set by placing back sampling (i.e. bootstrap sampling). In addition, for the node splitting of each decision tree, random forest will randomly select a part of features for evaluation, thus avoiding the problems of collinearity and overfitting between features. Finally, the random forest average the prediction results of all decision trees to get the final classification or regression results.
+
+Random forest has high accuracy, robustness and robustness(known for their ability to handle high-dimensional data and noisy or missing values), and is often used to solve classification, regression, clustering and other problems.
+
+The package named `ranger` is one of the implementations for random forest in R.
+```{r,cache=TRUE}
+set.seed(34)
+t3 <- system.time(ranger((y)~.,data=train_df)) # elapsed time for model generation before pca
+rf <- ranger((y)~.,data=train_df) # build a random forest without pca
+pred <- predict(rf,test_df[,-1])$predictions # prediction
+tab <- table(actual=test_df$y,predict=pred);tab # contingency table
+r3 <- sum(diag(tab))/sum(tab);r3 # misclassification rate
+
+
+t4 <- system.time(ranger(y~.,data=new_train)) # elapsed time for model generation after pca
+rf_mod <- ranger(y~.,data=new_train) # build a random forest with pca
+pred1 <- predict(rf_mod,new_test[,-1])$predictions
+tab1 <- table(actual=new_test$y,predict=pred1);tab1
+r4 <- sum(diag(tab1))/sum(tab1);r4
+```
+
+***The running times for the random forest classifier are respectively, and the misclassification rates are respectively, it seems to the pca has done an reasonably good job since the rates are pretty close, and the elapsed time is approximately halved in this case.***
+
+#### naive Bayes
+
+In machine learning, naive Bayes is a classification algorithm based on Bayes theorem. It is based on the assumption of independence among features, that is, the contribution of each feature to the classification results is independent of each other. The joint probability distribution of features and categories in the training set is used to estimate the posterior probability of the category to which the test samples belong, and the test samples are classified into the category with the highest probability. Because of its simple principle, efficient classification performance and good classification effect for small sample data, naive Bayes has been widely used in text classification, spam filtering, sentiment analysis and other fields.
+
+The package named `e1071` is one of the implementations for naive bayes in R.
+```{r,cache=TRUE}
+set.seed(56)
+t5 <- system.time(naiveBayes((y)~.,data=train_df)) # elapsed time for model generation before pca
+nb <- naiveBayes((y)~.,data=train_df) # build a naive bayes without pca
+pred <- predict(nb,test_df[,-1]) # prediction
+tab <- table(actual=test_df$y,predict=pred);tab # contingency table
+r5 <- sum(diag(tab))/sum(tab);r5 # misclassification rate
+
+
+t6 <- system.time(naiveBayes(y~.,data=new_train)) # elapsed time for model generation after pca
+nb_mod <- naiveBayes(y~.,data=new_train) # build a naive bayes with pca
+pred1 <- predict(nb_mod,new_test[,-1])
+tab1 <- table(actual=new_test$y,predict=pred1);tab1
+r6 <- sum(diag(tab1))/sum(tab1);r6
+```
+
+***The result in the classification is kind of surprised, it could due to data itself, but elapsed time for pca is obviously faster, even though there is a tiny difference, but it would be significant progress in larger dataset.***
+
+
+## KNN (k-nearest neighbors)
+
+KNN stands for k-nearest neighbors, a non-parametric classification algorithm in machine learning. It is a type of instance-based learning, where the algorithm makes predictions based on the closest (nearest) training examples in the feature space. KNN can be used for both classification and regression problems, depending on how the distance metric is defined and how the output is calculated.
+
+The package named `kknn` is one of the implementations for knn in R.
+```{r}
+set.seed(78)
+library(kknn)
+t7 <- system.time(kknn(y~.,train_df,test_df,k=10))
+knn <- kknn(y~.,train_df,test_df,k=10)
+tab <- table(knn$fitted.values,test_df$y)
+tab
+r7 <- sum(diag(tab))/sum(tab);r7
+
+t8 <- system.time(kknn(y~.,new_train,new_test,k=10))
+knn_mod <- kknn(y~.,new_train,new_test,k=10)
+tab1 <- table(knn_mod$fitted.values,new_test$y)
+tab1
+r8 <- sum(diag(tab1))/sum(tab1);r8
+```
+
+The result reveals that data with dimensional reduction seems to more accurate, and the elapsed time for the data after is even better than the data before pca.
+
+
+## Summary
+
+##### Visualization of some incorrect hand writing prediction in Knn
+```{r,warning=FALSE,message=FALSE}
+library(tidyverse)
+
+hw_sim <- test_df %>% 
+  add_column(pred=knn$fitted.values,.before = 1) %>% 
+  filter(y!=pred) %>% 
+  group_by(y) %>% 
+  dplyr::slice(1) %>% 
+  ungroup()
+y_sim <- 1:10 %>% 
+  map(~apply((matrix(((hw_sim[.,-(1:2)])),28,28)),2,as.numeric))
+m <- par(mfrow=c(2,5))
+for (i in 1:10) {
+  tempt <- y_sim[[i]]
+  image(1:28, 1:28, tempt[,nrow(tempt):1], col=gray((0:255)/255),axes=F,
+        main=glue::glue('Actual: {hw_sim$y[i]}  \nPredicted: {hw_sim$pred[i]}'),xlab = '',ylab='')
+}
+par(m) # reset 
+```
+
+##### Visualization of comparsion of elapsed time and misclassification rate for each model
+```{r}
+cmp <- tibble(time = c(t1[3],t3[3],t5[3],t7[3],t2[3],t4[3],t6[3],t8[3]),
+              rate = c(r1,r3,r5,r7,r2,r4,r6,r8),
+              pca = rep(c('before','after'),each=4),
+              model = rep(c('Tree','Random Forest','Naive Bayes','Knn'),2))
+cmp %>% 
+  mutate(model=fct_reorder(model,time,sum),
+         pca = fct_rev(pca)) %>% 
+  ggplot(aes(model,time,fill=pca))+geom_col(position = position_dodge())+
+  ylab('Elapsed time')+
+  theme(axis.title.y = element_text(angle=0,vjust=0.5))
+
+cmp %>%
+  ggplot(aes(model,rate))+geom_point(aes(col=pca))+geom_line(aes(group=pca,col=pca))+
+  ylab('Accuracy')+
+  theme(axis.title.y = element_text(angle=0,vjust=0.5))
+```
+
+
